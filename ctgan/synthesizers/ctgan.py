@@ -3,9 +3,9 @@
 import warnings
 # -----
 from ctgan import data
-from ctgan.synthesizers.transformer_generator import TransformerGenerator
+
 from ctgan.synthesizers.hybrid_generator import HybridGenerator
-from ctgan.synthesizers.improved_transformer_generator import ImprovedTransformerGenerator
+
 
 
 import numpy as np
