@@ -1,6 +1,12 @@
 """CTGAN module."""
 
 import warnings
+# changed
+from ctgan import data
+from ctgan.synthesizers.transformer_generator import TransformerGenerator
+from ctgan.synthesizers.hybrid_generator import HybridGenerator
+from ctgan.synthesizers.improved_transformer_generator import ImprovedTransformerGenerator
+
 
 import numpy as np
 import pandas as pd
@@ -12,10 +18,82 @@ from tqdm import tqdm
 from ctgan.data_sampler import DataSampler
 from ctgan.data_transformer import DataTransformer
 from ctgan.errors import InvalidDataError
-from ctgan.synthesizers._utils import _set_device, validate_and_set_device
 from ctgan.synthesizers.base import BaseSynthesizer, random_state
+# added for adaptive temperature scheduling
+
+def sample_gumbel(shape, device='cpu', eps=1e-20):
+    """Sample from Gumbel(0, 1) distribution."""
+    U = torch.rand(shape, device=device)
+    return -torch.log(-torch.log(U + eps) + eps)
 
 
+def gumbel_softmax_sample(logits, tau):
+    """Sample from Gumbel-Softmax distribution."""
+    g = sample_gumbel(logits.size(), device=logits.device)
+    y = (logits + g) / tau
+    return functional.softmax(y, dim=-1)
+
+
+def gumbel_softmax(logits, tau, hard=False):
+    """Gumbel-Softmax with optional straight-through hard sampling."""
+    y = gumbel_softmax_sample(logits, tau)
+    if hard:
+        _, k = y.max(-1)
+        y_hard = torch.zeros_like(y).scatter_(-1, k.unsqueeze(-1), 1.0)
+        y = (y_hard - y).detach() + y
+    return y
+
+
+def compute_tau_per_column(cardinality, importance, step, total_steps,
+                           tau_start=1.0, tau_final=0.1,
+                           w_card=0.5, w_time=0.4, w_imp=0.1,
+                           min_tau=0.05, max_tau=2.0, time_exp=1.0):
+    """
+    Compute adaptive temperature τ for each categorical column.
+    
+    Args:
+        cardinality (list): Number of categories for each column
+        importance (list): Importance weights (higher -> rarer/more important)
+        step (int): Current training step
+        total_steps (int): Total planned training steps
+        tau_start (float): Initial temperature
+        tau_final (float): Final temperature
+        w_card (float): Weight for cardinality effect
+        w_time (float): Weight for time annealing
+        w_imp (float): Weight for importance
+        min_tau (float): Minimum temperature
+        max_tau (float): Maximum temperature
+        time_exp (float): Time annealing exponent
+    
+    Returns:
+        torch.Tensor: Temperature values for each column
+    """
+    if not cardinality:
+        return torch.tensor([])
+    
+    card = torch.tensor(cardinality, dtype=torch.float32)
+    imp = torch.tensor(importance, dtype=torch.float32)
+    
+    # Cardinality-based component: higher cardinality -> higher tau (more exploration)
+    max_card = card.max().clamp(min=1.0)
+    tau_card = torch.log(card + 1.0) / torch.log(max_card + 1.0)
+    tau_card = tau_card * (max_tau - min_tau) + min_tau
+    
+    # Time-based annealing: start high, end low
+    frac = (1.0 - float(step) / float(total_steps)) ** time_exp
+    tau_time = tau_final + (tau_start - tau_final) * frac
+    
+    # Importance-based component: higher importance (rarer) -> lower tau (sharper decisions)
+    tau_imp = (1.0 - imp) * (max_tau - min_tau) + min_tau
+    
+    # Weighted combination
+    tau = w_card * tau_card + w_time * tau_time + w_imp * tau_imp
+    tau = torch.clamp(tau, min=min_tau, max=max_tau)
+    
+    return tau
+
+
+# ---------------------------------------------------
 class Discriminator(Module):
     """Discriminator for the CTGAN."""
 
@@ -139,11 +217,8 @@ class CTGAN(BaseSynthesizer):
         pac (int):
             Number of samples to group together when applying the discriminator.
             Defaults to 10.
-        enable_gpu (bool):
-            Whether to attempt to use GPU for computation.
-            Defaults to ``True``.
         cuda (bool):
-            **Deprecated** Whether to attempt to use cuda for GPU computation.
+            Whether to attempt to use cuda for GPU computation.
             If this is False or CUDA is not available, CPU will be used.
             Defaults to ``True``.
     """
@@ -163,8 +238,10 @@ class CTGAN(BaseSynthesizer):
         verbose=False,
         epochs=300,
         pac=10,
-        enable_gpu=True,
-        cuda=None,
+        cuda=True,
+        # <-- ADD THESE TWO params (same defaults as v1) for normalizer(akshit)
+        normalizer='vgm',
+        normalizer_kwargs=None,
     ):
         assert batch_size % 2 == 0
 
@@ -183,13 +260,36 @@ class CTGAN(BaseSynthesizer):
         self._verbose = verbose
         self._epochs = epochs
         self.pac = pac
-        self._device = validate_and_set_device(enable_gpu, cuda)
-        self._enable_gpu = cuda if cuda is not None else enable_gpu
+
+        if not cuda or not torch.cuda.is_available():
+            device = 'cpu'
+        elif isinstance(cuda, str):
+            device = cuda
+        else:
+            device = 'cuda'
+
+        self._device = torch.device(device)
+
         self._transformer = None
         self._data_sampler = None
         self._generator = None
         self.loss_values = None
+        # ---------- ADDED: keep normalizer settings from v1 ----------
+        self.normalizer = normalizer
+        self.normalizer_kwargs = normalizer_kwargs or {}
+        # -------------------------------------------------------------
 
+# changed
+
+        
+        # Adaptive temperature scheduling attributes
+        self._categorical_cardinality = []
+        self._categorical_importance = []
+        self._current_step = 0
+        self._total_steps = 0
+
+
+# ----------------------
     @staticmethod
     def _gumbel_softmax(logits, tau=1, hard=False, eps=1e-10, dim=-1):
         """Deals with the instability of the gumbel_softmax for older versions of torch.
@@ -222,35 +322,233 @@ class CTGAN(BaseSynthesizer):
         """Apply proper activation function to the output of the generator."""
         data_t = []
         st = 0
+        # added for adaptive temperature scheduling
+        categorical_idx = 0
+
+        # Compute adaptive temperatures for all categorical columns
+        if self._categorical_cardinality and self._total_steps > 0:
+            taus = compute_tau_per_column(
+                self._categorical_cardinality,
+                self._categorical_importance,
+                self._current_step,
+                self._total_steps
+            ).to(self._device)
+        else:
+            # Fallback to fixed tau if not initialized
+            taus = torch.tensor([0.2] * len(self._categorical_cardinality)).to(self._device)
+
+        # till this point
+        # --- helpers to support both tuple-format and object-format span_info ---
+        def _span_dim(span):
+            if isinstance(span, (tuple, list)):
+                return int(span[0])
+            if hasattr(span, "dim"):
+                return int(span.dim)
+            try:
+                return int(span)
+            except Exception:
+                raise TypeError(f"Unexpected span format: {type(span)} - {span!r}")
+
+        def _span_act(span):
+            if isinstance(span, (tuple, list)):
+                return span[1]
+            if hasattr(span, "activation_fn"):
+                return span.activation_fn
+            return None
+        # --------------------------------------------------------------------
+
         for column_info in self._transformer.output_info_list:
             for span_info in column_info:
-                if span_info.activation_fn == 'tanh':
-                    ed = st + span_info.dim
+                # Use helpers so existing code style (span_info.*) is preserved logically
+                span_act = _span_act(span_info)
+                span_dim = _span_dim(span_info)
+
+                if span_act == 'tanh':
+                    ed = st + span_dim
                     data_t.append(torch.tanh(data[:, st:ed]))
                     st = ed
-                elif span_info.activation_fn == 'softmax':
-                    ed = st + span_info.dim
-                    transformed = self._gumbel_softmax(data[:, st:ed], tau=0.2)
+                elif span_act == 'softmax':
+                    ed = st + span_dim
+                    # changed
+                    # transformed = self._gumbel_softmax(data[:, st:ed], tau=0.2) --- IGNORE ---
+                    # Use adaptive temperature for this categorical column
+                    if categorical_idx < len(taus):
+                        tau = taus[categorical_idx].item()
+                    else:
+                        tau = 0.2  # fallback
+
+                    transformed = gumbel_softmax(data[:, st:ed], tau=tau, hard=True)
                     data_t.append(transformed)
                     st = ed
+
+                    # added one line
+                    categorical_idx += 1
+                    # -----------
+
                 else:
-                    raise ValueError(f'Unexpected activation function {span_info.activation_fn}.')
+                    # keep the original error message style but use span_act if available
+                    raise ValueError(f'Unexpected activation function {span_act}.')
 
         return torch.cat(data_t, dim=1)
+    
+# #added
 
+#     def _initialize_categorical_info(self, train_data, discrete_columns):
+#         """Initialize categorical column information for adaptive temperature scheduling."""
+#         self._categorical_cardinality = []
+#         self._categorical_importance = []
+        
+#         for column_transform_info in self._transformer._column_transform_info_list:
+#             # Check if this is a discrete column
+#             if column_transform_info.column_type == 'discrete':
+#                 cardinality = column_transform_info.output_dimensions
+#                 self._categorical_cardinality.append(cardinality)
+                
+#                 # Compute importance based on rarity (inverse frequency)
+#                 column_name = column_transform_info.column_name
+                
+#                 if hasattr(train_data, 'columns') and column_name in train_data.columns:
+#                     # Calculate category frequencies
+#                     value_counts = train_data[column_name].value_counts()
+#                     # Normalize to get inverse frequency as importance
+#                     min_freq = value_counts.min()
+#                     max_freq = value_counts.max()
+#                     if max_freq > min_freq:
+#                         avg_inv_freq = (max_freq - value_counts.mean()) / (max_freq - min_freq)
+#                     else:
+#                         avg_inv_freq = 0.5
+#                     # Clip to [0, 1] range
+#                     importance = np.clip(avg_inv_freq, 0.0, 1.0)
+#                 else:
+#                     # Default importance for unknown columns
+#                     importance = 0.5
+#                 
+#                 self._categorical_importance.append(importance)
+
+    
+# #--------------------    
+
+    # added for normalizer
+    def _initialize_categorical_info(self, train_data, discrete_columns):
+        """Initialize categorical info for adaptive temperature scheduling.
+
+        Compatible with your DataTransformer._column_transform_info_list layout
+        (list of dicts with keys: 'column_name', 'column_type', 'transform_info').
+        """
+        self._categorical_cardinality = []
+        self._categorical_importance = []
+
+        # If no metadata available, leave defaults (will use fallback taus).
+        if not hasattr(self._transformer, "_column_transform_info_list"):
+            return
+
+        # Build a mapping from column name -> frequency importance (if train_data provided)
+        freq_importance = {}
+        if hasattr(train_data, "columns"):
+            for col in train_data.columns:
+                # compute a simple rarity importance: 1 - normalized_freq_mean
+                # But we'll compute later only for discrete columns
+                pass
+
+        # Iterate transform info list
+        for info in self._transformer._column_transform_info_list:
+            col_name = info.get("column_name")
+            col_type = info.get("column_type")
+            transform_info = info.get("transform_info", {})
+
+            if col_type != "discrete":
+                # skip continuous columns
+                continue
+
+            # cardinality: number of categories
+            if "num_categories" in transform_info:
+                cardinality = int(transform_info["num_categories"])
+            elif "num_components" in transform_info:
+                # fallback if used weird naming
+                cardinality = int(transform_info["num_components"])
+            else:
+                # conservative fallback
+                cardinality = 1
+
+            self._categorical_cardinality.append(cardinality)
+
+            # importance: based on rarity/inverse frequency if train_data present
+            importance = 0.5  # default
+            if hasattr(train_data, "columns") and col_name in train_data.columns:
+                try:
+                    vc = train_data[col_name].value_counts(dropna=True).astype(float)
+                    # normalize: importance = 1 - (mean_freq / max_freq)
+                    if len(vc) > 0:
+                        mean_freq = vc.mean()
+                        max_freq = vc.max()
+                        if max_freq > 0:
+                            importance = float(1.0 - (mean_freq / max_freq))
+                            # clip to [0,1]
+                            importance = float(np.clip(importance, 0.0, 1.0))
+                except Exception:
+                    importance = 0.5
+
+            self._categorical_importance.append(importance)
+
+    # def _cond_loss(self, data, c, m):
+    #     """Compute the cross entropy loss on the fixed discrete column."""
+    #     loss = []
+    #     st = 0
+    #     st_c = 0
+    #     for column_info in self._transformer.output_info_list:
+    #         for span_info in column_info:
+    #             if len(column_info) != 1 or span_info.activation_fn != 'softmax':
+    #                 # not discrete column
+    #                 st += span_info.dim
+    #             else:
+    #                 ed = st + span_info.dim
+    #                 ed_c = st_c + span_info.dim
+    #                 tmp = functional.cross_entropy(
+    #                     data[:, st:ed], torch.argmax(c[:, st_c:ed_c], dim=1), reduction='none'
+    #                 )
+    #                 loss.append(tmp)
+    #                 st = ed
+    #                 st_c = ed_c
+
+    #     loss = torch.stack(loss, dim=1)  # noqa: PD013
+
+    #     return (loss * m).sum() / data.size()[0]
     def _cond_loss(self, data, c, m):
-        """Compute the cross entropy loss on the fixed discrete column."""
+        """Compute the cross entropy loss on the fixed discrete column.
+
+        This version reads output_info_list spans in both tuple and object forms.
+        """
         loss = []
         st = 0
         st_c = 0
+
+        def _span_dim(span):
+            if isinstance(span, (tuple, list)):
+                return int(span[0])
+            if hasattr(span, "dim"):
+                return int(span.dim)
+            try:
+                return int(span)
+            except Exception:
+                raise TypeError(f"Unexpected span format: {type(span)} - {span!r}")
+
+        def _span_act(span):
+            if isinstance(span, (tuple, list)):
+                return span[1]
+            if hasattr(span, "activation_fn"):
+                return span.activation_fn
+            return None
+
         for column_info in self._transformer.output_info_list:
-            for span_info in column_info:
-                if len(column_info) != 1 or span_info.activation_fn != 'softmax':
-                    # not discrete column
-                    st += span_info.dim
+            for span in column_info:
+                act = _span_act(span)
+                dim = _span_dim(span)
+                if len(column_info) != 1 or act != 'softmax':
+                    # not a discrete single-span column we want to classify here
+                    st += dim
                 else:
-                    ed = st + span_info.dim
-                    ed_c = st_c + span_info.dim
+                    ed = st + dim
+                    ed_c = st_c + dim
                     tmp = functional.cross_entropy(
                         data[:, st:ed], torch.argmax(c[:, st_c:ed_c], dim=1), reduction='none'
                     )
@@ -258,10 +556,12 @@ class CTGAN(BaseSynthesizer):
                     st = ed
                     st_c = ed_c
 
-        loss = torch.stack(loss, dim=1)  # noqa: PD013
+        if not loss:
+            # no discrete single-span columns -> zero loss
+            return torch.tensor(0.0, device=data.device)
 
+        loss = torch.stack(loss, dim=1)  # shape (batch, n_discrete_cols)
         return (loss * m).sum() / data.size()[0]
-
     def _validate_discrete_columns(self, train_data, discrete_columns):
         """Check whether ``discrete_columns`` exists in ``train_data``.
 
@@ -313,6 +613,7 @@ class CTGAN(BaseSynthesizer):
             )
 
     @random_state
+    # fitting
     def fit(self, train_data, discrete_columns=(), epochs=None):
         """Fit the CTGAN Synthesizer models to the training data.
 
@@ -339,9 +640,36 @@ class CTGAN(BaseSynthesizer):
                 DeprecationWarning,
             )
 
-        self._transformer = DataTransformer()
+        # self._transformer = DataTransformer()
+        # self._transformer.fit(train_data, discrete_columns)
+        # Use the stored normalizer settings when creating the transformer
+        self._transformer = DataTransformer(
+            normalizer_type=self.normalizer,
+            normalizer_kwargs=self.normalizer_kwargs
+        )
         self._transformer.fit(train_data, discrete_columns)
 
+#added
+
+
+        # Convert numpy array to DataFrame if needed for categorical info extraction
+        if isinstance(train_data, np.ndarray):
+            if discrete_columns:
+                # Create column names for DataFrame conversion
+                column_names = [f'col_{i}' for i in range(train_data.shape[1])]
+                train_df = pd.DataFrame(train_data, columns=column_names)
+                discrete_col_names = [column_names[i] for i in discrete_columns] if discrete_columns else []
+            else:
+                train_df = train_data
+                discrete_col_names = []
+        else:
+            train_df = train_data
+            discrete_col_names = discrete_columns
+
+        # Initialize adaptive temperature scheduling
+        self._initialize_categorical_info(train_df, discrete_col_names)
+
+       #-----------------------
         train_data = self._transformer.transform(train_data)
 
         self._data_sampler = DataSampler(
@@ -350,10 +678,18 @@ class CTGAN(BaseSynthesizer):
 
         data_dim = self._transformer.output_dimensions
 
-        self._generator = Generator(
-            self._embedding_dim + self._data_sampler.dim_cond_vec(), self._generator_dim, data_dim
+        # self._generator = Generator(
+        #     self._embedding_dim + self._data_sampler.dim_cond_vec(), self._generator_dim, data_dim
+        # ).to(self._device)
+        
+        # Test hybrid approach - combines MLP baseline with transformer refinement
+        self._generator = HybridGenerator(
+            embedding_dim=self._embedding_dim + self._data_sampler.dim_cond_vec(),
+            generator_dim=self._generator_dim,
+            data_dim=data_dim,
+            nhead=2,
+            num_layers=1
         ).to(self._device)
-
         discriminator = Discriminator(
             data_dim + self._data_sampler.dim_cond_vec(), self._discriminator_dim, pac=self.pac
         ).to(self._device)
@@ -383,8 +719,20 @@ class CTGAN(BaseSynthesizer):
             epoch_iterator.set_description(description.format(gen=0, dis=0))
 
         steps_per_epoch = max(len(train_data) // self._batch_size, 1)
+
+        #added
+        
+        # Initialize training step tracking
+        self._total_steps = epochs * steps_per_epoch
+        self._current_step = 0
+        
+     #------------------
         for i in epoch_iterator:
             for id_ in range(steps_per_epoch):
+                #added
+                # Update current step for adaptive temperature
+                self._current_step = i * steps_per_epoch + id_
+                #------------------
                 for n in range(self._discriminator_steps):
                     fakez = torch.normal(mean=mean, std=std)
 
@@ -541,7 +889,6 @@ class CTGAN(BaseSynthesizer):
 
     def set_device(self, device):
         """Set the `device` to be used ('GPU' or 'CPU)."""
-        enable_gpu = getattr(self, '_enable_gpu', True)
-        self._device = _set_device(enable_gpu, device)
+        self._device = device
         if self._generator is not None:
             self._generator.to(self._device)

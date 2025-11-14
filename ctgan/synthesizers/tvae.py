@@ -10,7 +10,6 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from ctgan.data_transformer import DataTransformer
-from ctgan.synthesizers._utils import _set_device, validate_and_set_device
 from ctgan.synthesizers.base import BaseSynthesizer, random_state
 
 
@@ -115,9 +114,8 @@ class TVAE(BaseSynthesizer):
         batch_size=500,
         epochs=300,
         loss_factor=2,
-        enable_gpu=True,
+        cuda=True,
         verbose=False,
-        cuda=None,
     ):
         self.embedding_dim = embedding_dim
         self.compress_dims = compress_dims
@@ -129,8 +127,15 @@ class TVAE(BaseSynthesizer):
         self.epochs = epochs
         self.loss_values = pd.DataFrame(columns=['Epoch', 'Batch', 'Loss'])
         self.verbose = verbose
-        self._device = validate_and_set_device(enable_gpu, cuda)
-        self._enable_gpu = cuda if cuda is not None else enable_gpu
+
+        if not cuda or not torch.cuda.is_available():
+            device = 'cpu'
+        elif isinstance(cuda, str):
+            device = cuda
+        else:
+            device = 'cuda'
+
+        self._device = torch.device(device)
 
     @random_state
     def fit(self, train_data, discrete_columns=()):
@@ -236,7 +241,6 @@ class TVAE(BaseSynthesizer):
         return self.transformer.inverse_transform(data, sigmas.detach().cpu().numpy())
 
     def set_device(self, device):
-        """Set the `device` to be used ('GPU' or 'CPU')."""
-        enable_gpu = getattr(self, '_enable_gpu', True)
-        self._device = _set_device(enable_gpu, device)
+        """Set the `device` to be used ('GPU' or 'CPU)."""
+        self._device = device
         self.decoder.to(self._device)
