@@ -38,7 +38,7 @@ class DataSampler(object):
 
         def is_discrete_column(column_info):
             """Detect if the column_info corresponds to a discrete column."""
-            # discrete when it has exactly one span and that span's activation is softmax
+           
             if len(column_info) == 1:
                 act = _span_activation(column_info[0])
                 return act == 'softmax'
@@ -48,9 +48,7 @@ class DataSampler(object):
 
         self._discrete_column_matrix_st = np.zeros(n_discrete_columns, dtype='int32')
 
-        # Store the row id for each category in each discrete column.
-        # For example _rid_by_cat_cols[a][b] is a list of all rows with the
-        # a-th discrete column equal value b.
+       
         self._rid_by_cat_cols = []
 
         # Compute _rid_by_cat_cols
@@ -112,7 +110,7 @@ class DataSampler(object):
                     # fallback to uniform if no counts
                     category_prob = np.ones((dim,), dtype=float) / max(1, dim)
 
-                # assign into preallocated array (slice up to dim)
+                
                 if dim > 0:
                     self._discrete_column_category_prob[current_id, : dim] = category_prob
                 self._discrete_column_cond_st[current_id] = current_cond_st
@@ -196,7 +194,7 @@ class DataSampler(object):
 
         idx = []
         for c, o in zip(col, opt):
-            # if any category list is empty, choose random row fallback
+            
             rid_list = self._rid_by_cat_cols[c][o] if (c < len(self._rid_by_cat_cols) and o < len(self._rid_by_cat_cols[c])) else None
             if rid_list is None or len(rid_list) == 0:
                 idx.append(np.random.randint(len(data)))
